@@ -52,7 +52,11 @@
 Random::Random()
 {
     // default random seed
-    init(5489);
+    //init(5489);
+    //init(4489);
+    init(3489);
+    //init(2489);
+    //init(1489);
 }
 
 Random::Random(uint32_t s)

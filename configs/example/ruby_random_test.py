@@ -69,6 +69,8 @@ exec(compile( \
 # Set the default cache size and associativity to be very small to encourage
 # races between requests and writebacks.
 #
+
+# default cache size is 64 (--cahceline_size)
 options.l1d_size="256B"
 options.l1i_size="256B"
 options.l2_size="512B"
