@@ -30,10 +30,10 @@
 #ifndef __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 #define __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <sstream>
 
 #include "base/statistics.hh"
 #include "mem/protocol/CacheRequestType.hh"

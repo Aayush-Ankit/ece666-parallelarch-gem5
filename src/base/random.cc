@@ -49,14 +49,17 @@
 #include "base/logging.hh"
 #include "sim/serialize.hh"
 
+// added by Aayush
+#include <iostream>
+
 Random::Random()
 {
     // default random seed
-    //init(5489);
-    //init(4489);
-    init(3489);
-    //init(2489);
-    //init(1489);
+    int seed = 7489;
+    init(seed);
+    using namespace std;
+    cout << "Random Seed: " << seed << endl;
+    //init(3489); -- seed that failed for MSI at n8
 }
 
 Random::Random(uint32_t s)
