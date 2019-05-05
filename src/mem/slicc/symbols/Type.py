@@ -72,6 +72,10 @@ class Type(Symbol):
         if self.ident in ("TBETable"):
             self["tbe"] = "yes"
 
+        ## added for DSI
+        #if self.ident in ("DSIFifo"):
+        #    self["dsi"] = "yes"
+
         if self.ident == "TimerTable":
             self["timer"] = "yes"
 

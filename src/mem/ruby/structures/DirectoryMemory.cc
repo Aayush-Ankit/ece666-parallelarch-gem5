@@ -62,6 +62,8 @@ DirectoryMemory::DirectoryMemory(const Params *p)
     }
     m_size_bits = floorLog2(m_size_bytes);
     m_num_entries = 0;
+    version_bits = p->version_bits;
+    std::cout << "dsiVersion_bits: " << version_bits << "\n";
 }
 
 void
@@ -150,4 +152,9 @@ DirectoryMemory *
 RubyDirectoryMemoryParams::create()
 {
     return new DirectoryMemory(this);
+}
+
+// Added for DSI (bits to keep versioni)
+int DirectoryMemory::get_VersionMax() {
+    return (1 << version_bits);
 }

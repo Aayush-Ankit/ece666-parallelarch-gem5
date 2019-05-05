@@ -1,0 +1,7 @@
+# Notes for running splash2 for x86 (kbarr.net/splash2)
+
+1. Get splash 2 benchmarks
+2. For parmacs implementation, use pthread.m4.stougie (point it in makefile)
+3. Replace lmpc with lpthread, and other -Olimit flags and make (Tested: runs OCEAN, FFT, LU, RayTracing)
+
+

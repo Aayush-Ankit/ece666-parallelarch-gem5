@@ -184,6 +184,9 @@ structure (DirectoryMemory, external = "yes") {
   bool isPresent(Addr);
   void invalidateBlock(Addr);
   void recordRequestType(DirectoryRequestType);
+
+  // added for DSI
+  int get_VersionMax();
 }
 
 structure(AbstractCacheEntry, primitive="yes", external = "yes") {
@@ -198,6 +201,18 @@ structure (CacheMemory, external = "yes") {
   void allocateVoid(Addr, AbstractCacheEntry);
   void deallocate(Addr);
   AbstractCacheEntry lookup(Addr);
+
+  // added for DSI (new function added in mem/ruby/structures/CacheMemory.hh)
+  AbstractCacheEntry getNULL();
+  void dsiFIFO_push(Addr address);
+  void dsiFIFO_pop();
+  Addr dsiFIFO_getFront();
+  void dsiFIFO_print();
+  bool dsiFIFO_isEmpty();
+  int dsiFIFO_getSize();
+  bool dsiFIFO_isFull();
+  std::string dsiFIFO_get();
+
   bool isTagPresent(Addr);
   Cycles getTagLatency();
   Cycles getDataLatency();
@@ -213,6 +228,8 @@ structure (CacheMemory, external = "yes") {
 
   Scalar demand_misses;
   Scalar demand_hits;
+  Scalar num_self_invs;
+  Scalar num_invs;
 }
 
 structure (WireBuffer, inport="yes", outport="yes", external = "yes") {

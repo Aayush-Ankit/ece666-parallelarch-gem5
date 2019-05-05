@@ -101,6 +101,11 @@ class DirectoryMemory : public SimObject
      * this is all possible memory addresses.
      */
     const AddrRangeList addrRanges;
+
+    // Added for DSI (bits to keep versioni)
+    int version_bits;
+  public:
+    int get_VersionMax();
 };
 
 inline std::ostream&

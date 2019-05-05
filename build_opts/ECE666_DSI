@@ -1,0 +1,4 @@
+TARGET_ISA = 'x86'
+CPU_MODELS = 'AtomicSimpleCPU,O3CPU,TimingSimpleCPU'
+PROTOCOL = 'DSI'
+SLICC_HTML = 1

@@ -49,3 +49,8 @@ class RubyDirectoryMemory(SimObject):
     cxx_header = "mem/ruby/structures/DirectoryMemory.hh"
     addr_ranges = VectorParam.AddrRange(
         Parent.addr_ranges, "Address range this directory responds to")
+
+    #print ("Directory ", addr_ranges)
+
+    # added for DSI
+    version_bits = Param.Int(4, "Number of bits for DSI Versions at directory")

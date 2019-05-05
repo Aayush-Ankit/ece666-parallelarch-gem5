@@ -1,0 +1,1068 @@
+// Built upon MI_example-dir.sm - changes annotated by keyword Added
+
+machine(MachineType:Directory, "Directory protocol")
+    : DirectoryMemory * directory;
+      Cycles directory_latency := 1;
+      Cycles to_memory_controller_latency := 1;
+
+      MessageBuffer * forwardFromDir, network="To", virtual_network="3",
+            vnet_type="forward";
+      MessageBuffer * responseFromDir, network="To", virtual_network="4",
+            vnet_type="response";
+      MessageBuffer * dmaResponseFromDir, network="To", virtual_network="1",
+            vnet_type="response";
+
+      MessageBuffer * requestToDir, network="From", virtual_network="2",
+            vnet_type="request";
+      // Added - in mSI, directory can also receive response from cache
+      MessageBuffer * responseToDir, network="From", virtual_network="4",
+            vnet_type="response";
+      MessageBuffer * dmaRequestToDir, network="From", virtual_network="0",
+            vnet_type="request";
+      MessageBuffer * responseFromMemory;
+{
+  // STATES
+  state_declaration(State, desc="Directory states", default="Directory_State_I") {
+    // Base states
+    I, AccessPermission:Read_Write, desc="Invalid in all caches";
+    S, AccessPermission:Read_Only, desc="At least one cache has the blk";
+    M, AccessPermission:Invalid, desc="A cache has the block in M";
+
+    /****** Transient states for cache requests ******/ //(small d for data, large d for DMA)
+    // waiting for owner cache
+    S_D, AccessPermission:Busy,      desc="Moving from M to S, but need data from owner";
+
+    // Waiting for data from memory (md)
+    S_m, AccessPermission:Read_Write, desc="In S (or moving from I), waiting for mem"; //memory supplied data in S
+    M_m, AccessPermission:Read_Write, desc="Moving from I to M waiting for mem";
+
+    // Waiting for write-ack from memory (ma)
+    MI_m, AccessPermission:Busy,       desc="Moving from M to I waiting for ack";
+    SS_m, AccessPermission:Busy,       desc="Moving to S, got data from owner, writing to memory, waiting for ack";
+
+    /***** Transient states for DMA requests ******/
+    // data is M (owned), waiting for owner
+    M_DRD, AccessPermission:Busy, desc="Blocked on an invalidation for a DMA read";
+    M_DWR, AccessPermission:Busy, desc="Blocked on an invalidation for a DMA write";
+
+    // waiting for memory ack ( data from owner sent to memory)
+    M_DWRI, AccessPermission:Busy, desc="Intermediate state M_DWR-->I";
+    M_DRDI, AccessPermission:Busy, desc="Intermediate state M_DRD-->I";
+
+    // waiting for data from memory (data was invalid before)
+    I_DRD, AccessPermission:Busy, desc="Intermediate state for DMA_READ when in I, read from mmeory";
+    I_DWR, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
+
+    // waiting for data from memory (data was shared before)
+    S_DRD, AccessPermission:Busy, desc="Intermediate state for DMA_READ when in S, read from mmeory";
+    S_DWR, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in S, waiting for inv_acks from sharers and ack from memory";
+    S_DWRI, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in S, got inv_acks,waiting for mem ack";
+  }
+
+  // Events
+  enumeration(Event, desc="Directory events") {
+
+    // Data requests from the cache
+    GetS,         desc="Request for read-only data from cache";
+    GetM,         desc="Request for read-write data from cache";
+
+    // Writeback requests from the cache
+    PutSNotLast,  desc="PutS and the block has other sharers";
+    PutSLast,     desc="PutS and the block has no other sharers";
+    PutMOwner,    desc="Dirty data writeback from the owner";
+    PutMNonOwner, desc="Dirty data writeback from non-owner";
+
+    // Cache responses
+    Data, desc="Response to fwd request with data";
+    InvAck,         desc="Invalidation ack from other cache after Inv";
+
+    // Special event to simplify implementation
+    LastInvAck,     desc="Triggered after the last ack is received";
+
+    // DMA requests
+    DmaRead, desc="A DMA Read memory request";
+    DmaWrite, desc="A DMA Write memory request";
+
+    // From Memory
+    MemData, desc="Data from memory";
+    MemAck, desc="Ack from memory that write is complete";
+  }
+
+  // TYPES
+
+  // DirectoryEntry
+  structure(Entry, desc="...", interface="AbstractEntry") {
+    State DirectoryState,          desc="Directory state";
+    NetDest Sharers,                   desc="Sharers for this block";
+    NetDest Owner,                     desc="Owner of this block";
+
+    // added for DSI - version and two-bit vector per directory entry
+    int Version, default=0, desc="Version number for this block";
+    int VersionSharedCount, default=0, desc="Count number of shared-readable copies for a version";
+  }
+
+  // TBE entries for DMA requests
+  structure(TBE, desc="TBE entries for outstanding DMA requests") {
+    Addr PhysicalAddress, desc="physical address";
+    State TBEState,        desc="Transient State";
+    DataBlock DataBlk,     desc="Data to be written (DMA write only)";
+    int Len,               desc="...";
+    MachineID DmaRequestor, desc="DMA requestor";
+    int AcksOutstanding, default=0, desc="Number of acks left to receive";
+
+    // added for DSI
+    int Version, default=0, desc="Cache block version of requestor";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  // ** OBJECTS **
+  TBETable TBEs, template="<Directory_TBE>", constructor="m_number_of_TBEs";
+
+  Tick clockEdge();
+  Cycles ticksToCycles(Tick t);
+  Tick cyclesToTicks(Cycles c);
+  void set_tbe(TBE b);
+  void unset_tbe();
+
+  // Lazily populates directory entry
+  Entry getDirectoryEntry(Addr addr), return_by_pointer="yes" {
+    Entry dir_entry := static_cast(Entry, "pointer", directory[addr]);
+
+    if (is_valid(dir_entry)) {
+      return dir_entry;
+    }
+
+    dir_entry :=  static_cast(Entry, "pointer",
+                              directory.allocate(addr, new Entry));
+    return dir_entry;
+  }
+
+  State getState(TBE tbe, Addr addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (directory.isPresent(addr)) {
+      return getDirectoryEntry(addr).DirectoryState;
+    } else {
+      return State:I;
+    }
+  }
+
+  void setState(TBE tbe, Addr addr, State state) {
+
+    if (is_valid(tbe)) {
+      tbe.TBEState := state;
+    }
+
+    if (directory.isPresent(addr)) {
+
+      if (state == State:M) {
+        assert(getDirectoryEntry(addr).Owner.count() == 1);
+        assert(getDirectoryEntry(addr).Sharers.count() == 0);
+      }
+
+      getDirectoryEntry(addr).DirectoryState := state;
+
+      if (state == State:I)  {
+        assert(getDirectoryEntry(addr).Owner.count() == 0);
+        assert(getDirectoryEntry(addr).Sharers.count() == 0);
+      }
+    }
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      return Directory_State_to_permission(tbe.TBEState);
+    }
+
+    if(directory.isPresent(addr)) {
+      return Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState);
+    }
+
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Addr addr, State state) {
+    if (directory.isPresent(addr)) {
+      getDirectoryEntry(addr).changePermission(Directory_State_to_permission(state));
+    }
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+
+    TBE tbe := TBEs[addr];
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+            testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes + functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  // added for DSI - functions to access/modify version, two-bit information
+  // get version to determine self-inv or not
+  int getVersion (Entry e) {
+    assert(is_valid(e)); // must have a valid directory entry
+    return e.Version;
+  }
+
+  // increment version at every write request (request for exclusive copy)
+  void incVersion (Entry e) {
+    assert(is_valid(e)); // must have a valid directory entry
+    if (e.Version == directory.get_VersionMax()) {
+      e.Version := 1;
+    }
+    else {
+      e.Version := e.Version+1;
+    }
+  }
+
+  // get VersionSharedCount to determine self-inv or not
+  bool checkVersionSharedCount (Entry e) {
+    assert(is_valid(e)); // must have a valid directory entry
+    if (e.VersionSharedCount < 2) {
+        return false;
+    }
+    else {
+        return true;
+    }
+  }
+
+  void updateVersionSharedCount (Entry e) {
+    assert(is_valid(e)); // must have a valid directory entry
+    if (e.VersionSharedCount < 2) {
+      e.VersionSharedCount := (e.VersionSharedCount+1);
+    }
+  }
+
+  void clearVersionSharedCount (Entry e) {
+    assert(is_valid(e)); // must have a valid directory entry
+    e.VersionSharedCount := 0;
+  }
+
+
+  // ** OUT_PORTS **
+  out_port(forward_out, RequestMsg, forwardFromDir);
+  out_port(response_out, ResponseMsg, responseFromDir);
+  out_port(dmaResponseNetwork_out, DMAResponseMsg, dmaResponseFromDir);
+
+  // ** IN_PORTS **
+  in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
+    if (dmaRequestQueue_in.isReady(clockEdge())) {
+      peek(dmaRequestQueue_in, DMARequestMsg) {
+        TBE tbe := TBEs[in_msg.LineAddress];
+        if (in_msg.Type == DMARequestType:READ) {
+          trigger(Event:DmaRead, in_msg.LineAddress, tbe);
+        } else if (in_msg.Type == DMARequestType:WRITE) {
+          trigger(Event:DmaWrite, in_msg.LineAddress, tbe);
+        } else {
+          error("Invalid message");
+        }
+      }
+    }
+  }
+
+    // off-chip memory request/response is done
+    // memory buffer should have higher priority that request queue: Else Deadlock
+    in_port(memQueue_in, MemoryMsg, responseFromMemory) {
+      if (memQueue_in.isReady(clockEdge())) {
+        peek(memQueue_in, MemoryMsg) {
+          TBE tbe := TBEs[in_msg.addr];
+          if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
+            trigger(Event:MemData, in_msg.addr, tbe);
+          } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+            trigger(Event:MemAck, in_msg.addr, tbe);
+          } else {
+            DPRINTF(RubySlicc,"%s\n", in_msg.Type);
+            error("Invalid message");
+          }
+        }
+      }
+    }
+
+  in_port(response_in, ResponseMsg, responseToDir) {
+    if (response_in.isReady(clockEdge())) {
+        peek(response_in, ResponseMsg) {
+            // No TBE involved here
+            TBE tbe := TBEs[in_msg.addr];
+            if (in_msg.Type == CoherenceResponseType:Data) {
+                assert(is_invalid(tbe)); //an earlier DMA request must have allocated this tbe
+                trigger(Event:Data, in_msg.addr, tbe);
+            } else if (in_msg.Type == CoherenceResponseType:InvAck) {
+                assert(is_valid(tbe)); //an earlier DMA request must have allocated this tbe
+                if (tbe.AcksOutstanding > 1) {
+                    trigger(Event:InvAck, in_msg.addr, tbe);
+                } else if (tbe.AcksOutstanding == 1) {
+                    trigger(Event:LastInvAck, in_msg.addr, tbe);
+                } else {
+                    error("Unexpected InvAck response to Directory");
+                }
+
+            } else {
+                error("Unexpected message type.");
+            }
+        }
+    }
+  }
+
+  in_port(request_in, RequestMsg, requestToDir) {
+    if (request_in.isReady(clockEdge())) {
+      peek(request_in, RequestMsg) {
+        // No TBE involved here
+        Entry e := getDirectoryEntry(in_msg.addr);
+        TBE tbe := TBEs[in_msg.addr];
+        //assert(is_invalid(tbe)); //an earlier DMA request must have allocated this tbe
+        if (in_msg.Type == CoherenceRequestType:GetS) {
+            // NOTE: Since we don't have a TBE in this machine, there
+            // is no need to pass a TBE into trigger. Also, for the
+            // directory there is no cache entry.
+            trigger(Event:GetS, in_msg.addr, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:GetM) {
+            trigger(Event:GetM, in_msg.addr, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:PutS) {
+            assert(is_valid(e));
+            // If there is only a single sharer (i.e., the requestor)
+            if (e.Sharers.count() == 1) {
+                assert(e.Sharers.isElement(in_msg.Requestor));
+                trigger(Event:PutSLast, in_msg.addr, tbe);
+            } else {
+                trigger(Event:PutSNotLast, in_msg.addr, tbe);
+            }
+        } else if (in_msg.Type == CoherenceRequestType:PutM) {
+            assert(is_valid(e));
+            if (e.Owner.isElement(in_msg.Requestor)) {
+                trigger(Event:PutMOwner, in_msg.addr, tbe);
+            } else {
+                trigger(Event:PutMNonOwner, in_msg.addr, tbe);
+            }
+        } else {
+            error("Unexpected message type.");
+        }
+      }
+    }
+  }
+
+    /******* ACTIONS - non DMA only *******/
+    //memory actions - cache requests
+    action(sendMemRead, "r", desc="Send a memory read request") {
+        peek(request_in, RequestMsg) {
+            queueMemoryRead(in_msg.Requestor, address, to_memory_controller_latency);
+        }
+    }
+
+    action(sendDataToMem, "w", desc="Write data to memory") {
+        peek(request_in, RequestMsg) {
+            //DPRINTF(RubySlicc, "Writing memory for %#x\n", address);
+            //DPRINTF(RubySlicc, "Writing %s\n", in_msg.DataBlk);
+            queueMemoryWrite(in_msg.Requestor, address, to_memory_controller_latency,
+                             in_msg.DataBlk);
+        }
+    }
+
+    action(sendRespDataToMem, "rw", desc="Write data to memory from resp") {
+        peek(response_in, ResponseMsg) {
+            //DPRINTF(RubySlicc, "Writing memory for %#x\n", address);
+            //DPRINTF(RubySlicc, "Writing %s\n", in_msg.DataBlk);
+            queueMemoryWrite(in_msg.Sender, address, to_memory_controller_latency,
+                             in_msg.DataBlk);
+        }
+    }
+
+    // Sharer/owner actions
+    action(addReqToSharers, "aS", desc="Add requestor to sharer list") {
+        peek(request_in, RequestMsg) {
+            getDirectoryEntry(address).Sharers.add(in_msg.Requestor);
+        }
+    }
+
+    action(setOwner, "sO", desc="Set the owner") {
+        peek(request_in, RequestMsg) {
+            getDirectoryEntry(address).Owner.add(in_msg.Requestor);
+        }
+    }
+
+    action(addOwnerToSharers, "oS", desc="Add the owner to sharers") {
+        Entry e := getDirectoryEntry(address);
+        assert(e.Owner.count() == 1);
+        e.Sharers.addNetDest(e.Owner);
+    }
+
+    action(removeReqFromSharers, "rS", desc="Remove requestor from sharers") {
+        peek(request_in, RequestMsg) {
+            getDirectoryEntry(address).Sharers.remove(in_msg.Requestor);
+        }
+    }
+
+    action(clearSharers, "cS", desc="Clear the sharer list") {
+        getDirectoryEntry(address).Sharers.clear();
+    }
+
+    action(clearOwner, "cO", desc="Clear the owner") {
+        getDirectoryEntry(address).Owner.clear();
+    }
+
+
+    // Invalidates and forwards
+    action(sendInvToSharers, "i", desc="Send invalidate to all sharers") {
+        peek(request_in, RequestMsg) {
+            enqueue(forward_out, RequestMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:Inv;
+                out_msg.Requestor := in_msg.Requestor;
+                out_msg.Destination := getDirectoryEntry(address).Sharers;
+                out_msg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
+    action(sendFwdGetS, "fS", desc="Send forward getS to owner") {
+        assert(getDirectoryEntry(address).Owner.count() == 1);
+        peek(request_in, RequestMsg) {
+            enqueue(forward_out, RequestMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:GetS;
+                out_msg.Requestor := in_msg.Requestor;
+                out_msg.Destination := getDirectoryEntry(address).Owner;
+                out_msg.MessageSize := MessageSizeType:Control;
+                // added for DSI (directory sends the requestor's version to owner)
+                out_msg.Version := in_msg.Version;
+            }
+        }
+    }
+
+    action(sendFwdGetM, "fM", desc="Send forward getM to owner") {
+        assert(getDirectoryEntry(address).Owner.count() == 1);
+        peek(request_in, RequestMsg) {
+            enqueue(forward_out, RequestMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:GetM;
+                out_msg.Requestor := in_msg.Requestor;
+                out_msg.Destination := getDirectoryEntry(address).Owner;
+                out_msg.MessageSize := MessageSizeType:Control;
+                // added for DSI (directory sends the requestor's version to owner)
+                out_msg.Version := in_msg.Version;
+            }
+        }
+    }
+
+    // Responses to requests
+    // This also needs to send along the number of sharers!!!!
+    action(sendDataToReq, "d", desc="Send data from memory to requestor. ") {
+                                    //"May need to send sharer number, too") {
+        peek(memQueue_in, MemoryMsg) {
+            enqueue(response_out, ResponseMsg, directory_latency) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceResponseType:Data;
+                out_msg.Sender := machineID;
+                out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+                out_msg.DataBlk := in_msg.DataBlk;
+                out_msg.MessageSize := MessageSizeType:Data;
+                Entry e := getDirectoryEntry(address);
+                // Only need to include acks if we are the owner.
+                if (e.Owner.isElement(in_msg.OriginalRequestorMachId)) {
+                    out_msg.Acks := e.Sharers.count(); // from I->M
+                } else {
+                    out_msg.Acks := 0; // from I->S
+                }
+                assert(out_msg.Acks >= 0);
+                // added for DSI - set ifDSI depending on version check
+                TBE tbe := TBEs[address];
+                assert (is_valid(tbe));
+                out_msg.Version := e.Version;
+
+                //out_msg.ifDSI := true; // Hack to check if DSI cycle in cache works
+
+                if (tbe.Version == 0) { //requestor didn't send a version
+                  out_msg.ifDSI := false;
+                }
+                else if (tbe.Version != e.Version) { //version mismatch
+                  out_msg.ifDSI := true;
+                }
+                else if (e.Owner.isElement(in_msg.OriginalRequestorMachId)
+                          && checkVersionSharedCount(e)) { //write request, version match, other sharers
+                  out_msg.ifDSI := true;
+                }
+                else {
+                  out_msg.ifDSI := false;
+                }
+
+                DPRINTF(RubySlicc,"Address: 0x%x, DirVersion: %d, ReqVersion: %d, DirSharedCount: %d, ifWrite: %d, ifDSI: %s\n",
+                        address, e.Version, tbe.Version, e.VersionSharedCount, e.Owner.isElement(in_msg.OriginalRequestorMachId), out_msg.ifDSI);//?"true":"false");
+
+                APPEND_TRANSITION_COMMENT("DirVersion: ");
+                APPEND_TRANSITION_COMMENT(e.Version);
+                APPEND_TRANSITION_COMMENT(" ReqVersion: ");
+                APPEND_TRANSITION_COMMENT(tbe.Version);
+                APPEND_TRANSITION_COMMENT(" DirSharedCount: ");
+                APPEND_TRANSITION_COMMENT(e.VersionSharedCount);
+                APPEND_TRANSITION_COMMENT(" ifWrite: ");
+                APPEND_TRANSITION_COMMENT(e.Owner.isElement(in_msg.OriginalRequestorMachId));
+                APPEND_TRANSITION_COMMENT(" ifDSI ");
+                APPEND_TRANSITION_COMMENT(out_msg.ifDSI);
+            }
+        }
+    }
+
+    action(sendPutAck, "a", desc="Send the put ack") {
+        peek(request_in, RequestMsg) {
+            enqueue(forward_out, RequestMsg, directory_latency) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:PutAck;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.add(in_msg.Requestor);
+                out_msg.MessageSize := MessageSizeType:Control;
+                DPRINTF(RubySlicc, "PutAck sent to L1: %s, Address:0x%x\n", in_msg.Requestor, address);
+            }
+        }
+    }
+
+    action(sendPutNack, "na", desc="Send the put nack") {
+        peek(request_in, RequestMsg) {
+            enqueue(forward_out, RequestMsg, directory_latency) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:PutNack;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.add(in_msg.Requestor);
+                out_msg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
+    // Queue management
+    action(popResponseQueue, "pR", desc="Pop the response queue") {
+        response_in.dequeue(clockEdge());
+    }
+
+    action(popRequestQueue, "pQ", desc="Pop the request queue") {
+        request_in.dequeue(clockEdge());
+    }
+
+    action(popMemQueue, "pM", desc="Pop the memory queue") {
+        memQueue_in.dequeue(clockEdge());
+    }
+
+    // Stalling actions
+    action(stall, "z", desc="Stall the incoming request") {
+        // Do nothing.
+    }
+
+    // added for DSI
+    action (updateVersion, "uV", desc="Update version on request for exclusive copy") {
+      Entry e := getDirectoryEntry(address);
+      incVersion(e);
+      checkVersionSharedCount(e);
+      DPRINTF(RubySlicc, "Directory Updates Version: %d\n", e.Version);
+      //APPEND_TRANSITION_COMMENT("Version: ");
+      //APPEND_TRANSITION_COMMENT(e.Version);
+    }
+
+    // added for DSI
+    action (updateSharedCount, "uVsc", desc="Update version shared count on read request") {
+      Entry e := getDirectoryEntry(address);
+      updateVersionSharedCount(e);
+      DPRINTF(RubySlicc, "Directory Updates Version Shared Count: %d\n", e.VersionSharedCount);
+      //APPEND_TRANSITION_COMMENT("SharedCount: ");
+      //APPEND_TRANSITION_COMMENT(e.VersionSharedCount);
+    }
+
+    // added for DSI
+    action (allocateTBE, "atbe", desc="Allocate TBE and add requestor's version") {
+      assert (is_invalid(tbe));
+      peek(request_in, RequestMsg) {
+        TBEs.allocate(address);
+        set_tbe(TBEs[address]);
+        tbe.Version := in_msg.Version;
+      }
+    }
+
+    // added for DSI
+    action(deallocateTBE, "dtbe", desc="Deallocate TBE") {
+      assert(is_valid(tbe));
+      TBEs.deallocate(address);
+      unset_tbe();
+    }
+
+
+    /******* TRANSITIONSNS - non DMA only *******/
+    transition({I, S}, GetS, S_m) {
+        // added for DSI - holds version of requestor until
+        // directory serves the request (after memory data)
+        allocateTBE;
+        sendMemRead;
+        addReqToSharers;
+        // added for DSI
+        updateSharedCount;
+        popRequestQueue;
+    }
+
+    transition(I, {PutSNotLast, PutSLast, PutMNonOwner}) {
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition(S_m, MemData, S) {
+        sendDataToReq;
+        popMemQueue;
+        // added for DSI - holds version of requestor until
+        // directory serves the request (after memory data)
+        deallocateTBE;
+    }
+
+    transition(I, GetM, M_m) {
+        // added for DSI - holds version of requestor until
+        // directory serves the request (after memory data)
+        allocateTBE;
+        sendMemRead;
+        setOwner;
+        popRequestQueue;
+    }
+
+    transition(M_m, MemData, M) {
+        sendDataToReq;
+        clearSharers; // NOTE: This isn't *required* in some cases.
+        popMemQueue;
+        // added for DSI - update Version after requestor's write request is served
+        updateVersion; //increments version and clears VersionSharedCount
+        // added for DSI - holds version of requestor until
+        // directory serves the request (after memory data)
+        deallocateTBE;
+    }
+
+    transition(S, GetM, M_m) {
+        // added for DSI - holds version of requestor until
+        // directory serves the request (after memory data)
+        allocateTBE;
+        sendMemRead;
+        removeReqFromSharers;
+        sendInvToSharers;
+        setOwner;
+        popRequestQueue;
+    }
+
+    //transition({S, S_D, SS_m, S_m}, {PutSNotLast, PutMNonOwner}) {
+    //    removeReqFromSharers;
+    //    sendPutAck;
+    //    popRequestQueue;
+    //}
+
+    transition({S, S_D, SS_m, S_m}, PutSNotLast) {
+        removeReqFromSharers;
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition({S, SS_m, S_m}, PutMNonOwner) {
+        removeReqFromSharers;
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition(S, PutSLast, I) {
+        removeReqFromSharers;
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition(M, GetS, S_D) {
+        sendFwdGetS;
+        addReqToSharers;
+        addOwnerToSharers;
+        clearOwner;
+        // added for DSI
+        updateSharedCount;
+        popRequestQueue;
+    }
+
+    transition(M, GetM) {
+        sendFwdGetM;
+        clearOwner;
+        setOwner;
+        // added for DSI (version comparison for DSI will be done by owner)
+        updateVersion; //increments version and clears VersionSharedCount
+        popRequestQueue;
+    }
+
+    // NOTE: In M, on PutMNonOwner, need to send PutNack
+    //transition({M, M_m, MI_m}, {PutSNotLast, PutSLast, PutMNonOwner}) {
+    //    sendPutAck;
+    //    popRequestQueue;
+    //}
+
+    transition({M_m, MI_m}, {PutSNotLast, PutSLast, PutMNonOwner}) {
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition(M, {PutSNotLast, PutSLast}) {
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition(M, PutMNonOwner) { //PutM from Cache (previous owner, now not-owner) intercepted by GetM from another cache
+        sendPutNack;
+        popRequestQueue;
+    }
+
+    transition(S_D, PutMNonOwner) { // PutM from Cache (previous cache, now sharer) intercepted by GetS from another cache
+        removeReqFromSharers;
+        sendPutNack;
+        popRequestQueue;
+    }
+
+    transition(M, PutMOwner, MI_m) {
+        sendDataToMem;
+        clearOwner;
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition(MI_m, MemAck, I) {
+        popMemQueue;
+    }
+
+    transition(S_D, {GetS, GetM}) {
+        stall;
+    }
+
+    //transition(S_D, PutSLast) {
+    //    removeReqFromSharers;
+    //    sendPutAck;
+    //    popRequestQueue;
+    //}
+
+    transition({S_D,SS_m}, PutSLast) {
+        removeReqFromSharers;
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition(S_D, Data, SS_m) {
+        sendRespDataToMem;
+        popResponseQueue;
+    }
+
+    transition(SS_m, MemAck, S) {
+        popMemQueue;
+    }
+
+    // If we get another request for a block that's waiting on memory,
+    // stall that request.
+    transition({MI_m, SS_m, S_m, M_m}, {GetS, GetM}) {
+        stall;
+    }
+
+    /******* ACTIONS (and actiosn for TBE) and TRANSITIONS - DMA only *******/
+    action(dr_sendDMAData, "dr", desc="Send Data to DMA controller from directory") {
+        peek(memQueue_in, MemoryMsg) {
+            enqueue(dmaResponseNetwork_out, DMAResponseMsg, 1) {
+                assert(is_valid(tbe));
+                out_msg.PhysicalAddress := address;
+                out_msg.LineAddress := address;
+                out_msg.Type := DMAResponseType:DATA;
+                out_msg.DataBlk := in_msg.DataBlk;   // we send the entire data block and rely on the dma controller to split it up if need be
+                out_msg.Destination.add(tbe.DmaRequestor);
+                out_msg.MessageSize := MessageSizeType:Response_Data;
+            }
+        }
+    }
+
+    action(drp_sendDMAData, "drp", desc="Send Data to DMA controller from incoming Data from owner") {
+        peek(response_in, ResponseMsg) {
+            enqueue(dmaResponseNetwork_out, DMAResponseMsg, 1) {
+                assert(is_valid(tbe));
+                out_msg.PhysicalAddress := address;
+                out_msg.LineAddress := address;
+                out_msg.Type := DMAResponseType:DATA;
+
+                // we send the entire data block and rely on the dma controller
+                // to split it up if need be
+                out_msg.DataBlk := in_msg.DataBlk;
+                out_msg.Destination.add(tbe.DmaRequestor);
+                out_msg.MessageSize := MessageSizeType:Response_Data;
+            }
+        }
+    }
+
+    action(da_sendDMAAck, "da", desc="Send Ack to DMA controller") {
+        enqueue(dmaResponseNetwork_out, DMAResponseMsg, 1) {
+            assert(is_valid(tbe));
+            out_msg.PhysicalAddress := address;
+            out_msg.LineAddress := address;
+            out_msg.Type := DMAResponseType:ACK;
+            out_msg.Destination.add(tbe.DmaRequestor);
+            out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        }
+    }
+
+    action(p_popIncomingDMARequestQueue, "p", desc="Pop incoming DMA queue") {
+        dmaRequestQueue_in.dequeue(clockEdge());
+    }
+
+    action(v_allocateTBE, "vtb", desc="Allocate TBE") {
+      assert(is_invalid(tbe));
+      peek(dmaRequestQueue_in, DMARequestMsg) {
+        TBEs.allocate(address);
+        set_tbe(TBEs[address]);
+        tbe.DataBlk := in_msg.DataBlk;
+        tbe.PhysicalAddress := in_msg.PhysicalAddress;
+        tbe.Len := in_msg.Len;
+        tbe.DmaRequestor := in_msg.Requestor;
+      }
+    }
+
+    action(r_allocateTbeForDmaRead, "vr", desc="Allocate TBE for DMA Read") {
+      assert(is_invalid(tbe));
+      peek(dmaRequestQueue_in, DMARequestMsg) {
+        TBEs.allocate(address);
+        set_tbe(TBEs[address]);
+        tbe.DmaRequestor := in_msg.Requestor;
+      }
+    }
+
+
+    // Not using TBE for cache requests
+    //action(v_allocatetbefromrequestnet, "\v", desc="allocate tbe") {
+    //  peek(requestqueue_in, requestmsg) {
+    //    tbes.allocate(address);
+    //    set_tbe(tbes[address]);
+    //    tbe.datablk := in_msg.datablk;
+    //  }
+    //}
+
+    action(w_deallocateTBE, "dtb", desc="Deallocate TBE") {
+      assert(is_valid(tbe));
+      TBEs.deallocate(address);
+      unset_tbe();
+    }
+
+    action(qf_queueMemoryFetchRequestDMA, "qfd", desc="Queue off-chip fetch request") {
+      peek(dmaRequestQueue_in, DMARequestMsg) {
+        queueMemoryRead(in_msg.Requestor, address, to_memory_controller_latency);
+      }
+    }
+
+    action(qw_queueMemoryWBRequest_partial, "qwp", desc="Queue off-chip writeback request for directly write dma data") {
+      peek(dmaRequestQueue_in, DMARequestMsg) {
+        queueMemoryWritePartial(in_msg.Requestor, address,
+                                to_memory_controller_latency, in_msg.DataBlk,
+                                in_msg.Len);
+      }
+    }
+
+    action(qw_queueMemoryWBRequest_partialTBE, "qwt", desc="Queue off-chip writeback request, wait for owners data and then write dma data") {
+        peek(response_in, ResponseMsg) {
+            queueMemoryWritePartial(in_msg.Sender, address,
+                              to_memory_controller_latency, tbe.DataBlk,
+                              tbe.Len);
+        }
+    }
+
+    action(dma_sendFwdGetM, "dfM", desc="Send forward getM to owner for DMA, with dir as requestor") {
+        assert(getDirectoryEntry(address).Owner.count() == 1);
+        peek(dmaRequestQueue_in, DMARequestMsg) {
+            enqueue(forward_out, RequestMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:GetM;
+                //out_msg.Requestor := mapAddressToMachine(address, MachineType:Directory);
+                out_msg.Requestor := machineID;
+                out_msg.Destination := getDirectoryEntry(address).Owner;
+                out_msg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
+    action(dma_sendInvToSharers, "di", desc="Send invalidate to all sharers for DMA") {
+        peek(dmaRequestQueue_in, DMARequestMsg) {
+            enqueue(forward_out, RequestMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:Inv;
+                out_msg.Requestor := machineID;
+                out_msg.Destination := getDirectoryEntry(address).Sharers;
+                out_msg.MessageSize := MessageSizeType:Control;
+            }
+        }
+    }
+
+    action(dma_decrAcks, "dda", desc="Decrement the number of acks") {
+        assert(is_valid(tbe));
+        tbe.AcksOutstanding := tbe.AcksOutstanding - 1;
+        assert(tbe.AcksOutstanding >= 0); //can't be negative
+        APPEND_TRANSITION_COMMENT("Acks: ");
+        APPEND_TRANSITION_COMMENT(tbe.AcksOutstanding);
+    }
+
+    action(dma_storeAcks, "dsa", desc="Store the needed acks to the TBE") {
+        Entry e := getDirectoryEntry(address);
+        assert (is_valid(e));
+        assert(is_valid(tbe));
+        tbe.AcksOutstanding := e.Sharers.count();
+        assert(tbe.AcksOutstanding >= 1); //atleast one sharer should be there
+    }
+
+    // DMA reading/writing to a modified block, stall all cache accesses to block since
+    // (block is moving to Invalid)
+    transition({M_DRD, M_DWR, M_DWRI, M_DRDI}, {GetS, GetM}) {
+        stall;
+    }
+
+    // DMA reading/writing to an invalid block, stall all cache accesses to block
+    // as waiting for memory
+    transition({I_DRD, I_DWR}, {GetS, GetM} ) {
+        stall;
+    }
+
+    // DMA writing/reading to a shared block, stall all cache accesses to block
+    // as block will move to Invalid(for WR), waiting for memory (RD)
+    transition({S_DWR, S_DWRI, S_DRD}, {GetS, GetM} ) {
+        stall;
+    }
+
+    // Stall DmaRead, DmaWrite on all intermediate cache-related states
+    transition({S_D, S_m, M_m, MI_m, SS_m}, {DmaRead, DmaWrite} ) {
+        stall;
+    }
+
+    // PENDING: Put* events on intermediate states of DMA transactions (refer table 8.2)
+    transition({M_DRD, M_DWR, M_DWRI, M_DRDI}, {PutSNotLast, PutSLast, PutMNonOwner}) {
+        sendPutAck;
+        popRequestQueue;
+    }
+    // NOTE: PutMOwner cannot arrive in intermediate states of DMA transactions originating from M, as
+    // dir. already clears the owner
+
+    transition({I_DRD, I_DWR}, {PutSNotLast, PutSLast, PutMNonOwner}) {
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    transition({S_DRD, S_DWR, S_DWRI}, {PutSNotLast, PutSLast, PutMNonOwner}) {
+        removeReqFromSharers;
+        sendPutAck;
+        popRequestQueue;
+    }
+
+    // PENDING: DmaRead, DmaWrite originating in stable states: S, I, M
+    // DMA read in Shared
+    transition(S, DmaRead, S_DRD) {
+        r_allocateTbeForDmaRead;
+        qf_queueMemoryFetchRequestDMA;
+        p_popIncomingDMARequestQueue;
+    }
+
+    transition(S_DRD, MemData, S) {
+        dr_sendDMAData;
+        w_deallocateTBE;
+        popMemQueue;
+    }
+
+    // DMA read in invalid
+    transition(I, DmaRead, I_DRD) {
+        r_allocateTbeForDmaRead;
+        qf_queueMemoryFetchRequestDMA;
+        p_popIncomingDMARequestQueue;
+    }
+
+    transition(I_DRD, MemData, I) {
+        dr_sendDMAData;
+        w_deallocateTBE;
+        popMemQueue;
+    }
+
+    // DMA read in modified
+    transition(M, DmaRead, M_DRD) {
+        v_allocateTBE;
+        // send FwdGetm with dir as requestor
+        dma_sendFwdGetM;
+        p_popIncomingDMARequestQueue;
+    }
+
+    transition(M_DRD, Data, M_DRDI) {
+        drp_sendDMAData;
+        clearOwner;
+        sendRespDataToMem;
+        popResponseQueue;
+    }
+
+    transition(M_DRDI, MemAck, I) {
+        w_deallocateTBE;
+        popMemQueue;
+    }
+
+    // DMA write in I
+    transition(I, DmaWrite, I_DWR) {
+        v_allocateTBE;
+        qw_queueMemoryWBRequest_partial;
+        p_popIncomingDMARequestQueue;
+    }
+
+    transition(I_DWR, MemAck, I) {
+        da_sendDMAAck;
+        w_deallocateTBE;
+        popMemQueue;
+    }
+
+    // DMA write in M
+    transition(M, DmaWrite, M_DWR) {
+        v_allocateTBE;
+        dma_sendFwdGetM;
+        p_popIncomingDMARequestQueue;
+    }
+
+    transition(M_DWR, Data, M_DWRI) {
+        qw_queueMemoryWBRequest_partialTBE;
+        clearOwner;
+        popResponseQueue;
+    }
+
+    transition(M_DWRI, MemAck, I) {
+        da_sendDMAAck;
+        w_deallocateTBE;
+        popMemQueue;
+    }
+
+    // DMA write in S
+    transition(S, DmaWrite, S_DWR) {
+        v_allocateTBE;
+        dma_storeAcks;
+        dma_sendInvToSharers;
+        p_popIncomingDMARequestQueue;
+    }
+
+    transition(S_DWR, InvAck, S_DWR) {
+        // NOTE: no need to remove teh sharer, as all incoming requsts will
+        // be blocked in termediate DMA states
+        dma_decrAcks;
+        popResponseQueue;
+    }
+
+    transition(S_DWR, LastInvAck, S_DWRI) {
+        clearSharers;
+        dma_decrAcks;
+        qw_queueMemoryWBRequest_partialTBE;
+        popResponseQueue;
+    }
+
+    transition(S_DWRI, MemAck, I) {
+        da_sendDMAAck;
+        w_deallocateTBE;
+        popMemQueue;
+    }
+
+}

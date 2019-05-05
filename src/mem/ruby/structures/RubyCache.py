@@ -50,3 +50,6 @@ class RubyCache(SimObject):
     tagAccessLatency = Param.Cycles(1, "cycles for a tag array access")
     resourceStalls = Param.Bool(False, "stall if there is a resource failure")
     ruby_system = Param.RubySystem(Parent.any, "")
+
+    # added for DSI
+    dsiFIFO_size = Param.Int (64, "Number of entries in DSI FIFO")

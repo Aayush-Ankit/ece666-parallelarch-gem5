@@ -46,6 +46,7 @@ all_protocols.extend([
     'MOESI_hammer',
     'Garnet_standalone',
     'MSI', #added for ece666-hw2
+    'DSI', #added for ece666-project
     'None'
     ])
 

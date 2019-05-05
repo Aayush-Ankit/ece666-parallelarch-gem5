@@ -116,6 +116,12 @@ def addNoISAOptions(parser):
     parser.add_option("--l3_assoc", type="int", default=16)
     parser.add_option("--cacheline_size", type="int", default=64)
 
+    # added for DSI
+    parser.add_option("--l1d_dsiFIFO_size", type="int", default=8)
+    parser.add_option("--dsi_version_bits", type="int", default=2) # PENDING??
+    parser.add_option("--DSI_MODE", type="int", default=0) # PENDING??
+
+
     # Enable Ruby
     parser.add_option("--ruby", action="store_true")
 

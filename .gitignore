@@ -29,3 +29,5 @@ m5out
 # Added by Aayush Ankit
 hw2_traces/
 sim_traces/
+
+.*.sw*

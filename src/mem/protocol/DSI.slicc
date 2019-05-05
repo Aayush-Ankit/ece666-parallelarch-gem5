@@ -1,0 +1,6 @@
+protocol "DSI";
+include "RubySlicc_interfaces.slicc";
+include "DSI-msg.sm";
+include "DSI-cache.sm";
+include "DSI-dir.sm";
+

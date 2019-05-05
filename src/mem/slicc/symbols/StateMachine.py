@@ -91,6 +91,8 @@ class StateMachine(Symbol):
         # form the entire set of data members of the machine.
         self.objects = []
         self.TBEType   = None
+        ## added for DSI
+        #self.DSIType   = None
         self.EntryType = None
         self.debug_flags = set()
         self.debug_flags.add('RubyGenerated')

@@ -39,6 +39,9 @@
 #include "mem/ruby/system/RubySystem.hh"
 #include "mem/ruby/system/WeightedLRUPolicy.hh"
 
+// added for DSI
+#include <iostream>
+
 using namespace std;
 
 ostream&
@@ -70,6 +73,10 @@ CacheMemory::CacheMemory(const Params *p)
     m_is_instruction_only_cache = p->is_icache;
     m_resource_stalls = p->resourceStalls;
     m_block_size = p->block_size;  // may be 0 at this point. Updated in init()
+
+    // added for DSI
+    dsiFIFO_size = p->dsiFIFO_size;
+    std::cout << "dsiFIFO_size: " << dsiFIFO_size << "\n";
 }
 
 void
@@ -255,6 +262,31 @@ AbstractCacheEntry*
 CacheMemory::allocate(Addr address, AbstractCacheEntry *entry, bool touch)
 {
     assert(address == makeLineAddress(address));
+
+    // modified for DSI (allocate can find a tag for invalidated cache block)
+    if (isTagPresent(address)) {
+      int64_t cacheSet = addressToCacheSet(address);
+      std::vector<AbstractCacheEntry*> &set = m_cache[cacheSet];
+      int loc = findTagInSet(cacheSet, address);
+      assert (loc != -1);
+
+      set[loc] = entry;  // Init entry
+      set[loc]->m_Address = address;
+      set[loc]->m_Permission = AccessPermission_Invalid;
+      DPRINTF(RubyCache, "Allocate clearing lock for addr: %x\n",
+              address);
+      set[loc]->m_locked = -1;
+      m_tag_index[address] = loc;
+      entry->setSetIndex(cacheSet);
+      entry->setWayIndex(loc);
+
+      if (touch) {
+          m_replacementPolicy_ptr->touch(cacheSet, loc, curTick());
+      }
+
+      return entry;
+    }
+
     assert(!isTagPresent(address));
     assert(cacheAvail(address));
     DPRINTF(RubyCache, "address: %#x\n", address);
@@ -327,6 +359,14 @@ CacheMemory::lookup(Addr address)
     int loc = findTagInSet(cacheSet, address);
     if (loc == -1) return NULL;
     return m_cache[cacheSet][loc];
+}
+
+// added for DSI
+//// looks an address up in the cache
+AbstractCacheEntry*
+CacheMemory::getNULL()
+{
+    return NULL;
 }
 
 // looks an address up in the cache
@@ -507,6 +547,16 @@ CacheMemory::regStats()
         .desc("Number of cache demand accesses")
         ;
 
+    m_num_self_invs
+        .name(name() + ".num_self_invs")
+        .desc("Number of self invalidations")
+        ;
+
+    m_num_invs
+        .name(name() + ".num_invs")
+        .desc("Number of invalidations")
+        ;
+
     m_demand_accesses = m_demand_hits + m_demand_misses;
 
     m_sw_prefetches
@@ -652,4 +702,50 @@ bool
 CacheMemory::isBlockNotBusy(int64_t cache_set, int64_t loc)
 {
   return (m_cache[cache_set][loc]->m_Permission != AccessPermission_Busy);
+}
+
+// added for DSI
+void CacheMemory::dsiFIFO_push(Addr address) {
+  assert ((dsiFIFO_size - dsiFIFO.size()) > 0);
+  dsiFIFO.push_back(address);
+}
+
+void CacheMemory::dsiFIFO_pop() {
+  assert (dsiFIFO.size() > 0);
+  dsiFIFO.erase(dsiFIFO.begin());
+}
+
+Addr CacheMemory::dsiFIFO_getFront() {
+  assert (dsiFIFO.size() > 0);
+  Addr temp = dsiFIFO.front();
+  return temp;
+}
+
+void CacheMemory::dsiFIFO_print() {
+  if (dsiFIFO.size() == 0)
+    std::cout << "Empty \n";
+  else {
+    for (std::vector<Addr>::iterator it=dsiFIFO.begin(); it!=dsiFIFO.end(); it++)
+      std::cout << *it << ", \n";
+  }
+}
+
+bool CacheMemory::dsiFIFO_isEmpty() {
+  return (dsiFIFO.size()>0);
+}
+
+int CacheMemory::dsiFIFO_getSize() {
+  return dsiFIFO.size();
+}
+
+bool CacheMemory::dsiFIFO_isFull() {
+  return (dsiFIFO.size() == dsiFIFO_size);
+}
+
+std::string CacheMemory::dsiFIFO_get() {
+    std::stringstream ss;
+    for (std::vector<Addr>::iterator it=dsiFIFO.begin(); it!=dsiFIFO.end(); it++) {
+      ss << "Ox" << std::hex << (*it) << " ";
+    }
+    return ss.str();
 }

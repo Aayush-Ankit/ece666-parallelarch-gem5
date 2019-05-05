@@ -33,6 +33,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <sstream>
 
 #include "base/statistics.hh"
 #include "mem/protocol/CacheRequestType.hh"
@@ -95,6 +96,9 @@ class CacheMemory : public SimObject
     AbstractCacheEntry* lookup(Addr address);
     const AbstractCacheEntry* lookup(Addr address) const;
 
+    // added for DSI (return a NULL cache entry)
+    AbstractCacheEntry* getNULL();
+
     Cycles getTagLatency() const { return tagArray.getLatency(); }
     Cycles getDataLatency() const { return dataArray.getLatency(); }
 
@@ -130,6 +134,8 @@ class CacheMemory : public SimObject
   public:
     Stats::Scalar m_demand_hits;
     Stats::Scalar m_demand_misses;
+    Stats::Scalar m_num_self_invs;
+    Stats::Scalar m_num_invs;
     Stats::Formula m_demand_accesses;
 
     Stats::Scalar m_sw_prefetches;
@@ -185,6 +191,21 @@ class CacheMemory : public SimObject
     int m_start_index_bit;
     bool m_resource_stalls;
     int m_block_size;
+
+  // added for DSI
+  private:
+    std::vector<Addr> dsiFIFO;
+    int dsiFIFO_size;
+
+  public:
+    void dsiFIFO_push(Addr address);
+    void dsiFIFO_pop();
+    Addr dsiFIFO_getFront();
+    void dsiFIFO_print();
+    bool dsiFIFO_isEmpty();
+    int dsiFIFO_getSize();
+    bool dsiFIFO_isFull();
+    std::string dsiFIFO_get();
 };
 
 std::ostream& operator<<(std::ostream& out, const CacheMemory& obj);
